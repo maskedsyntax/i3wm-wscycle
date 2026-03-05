@@ -5,13 +5,20 @@ import json
 import i3ipc
 
 
+import time
+
+
 STATE_FILE = os.path.expanduser("~/.cache/i3wm-wscycle-state.json")
 LOG_FILE = "/tmp/i3-wscycle.log"
+HISTORY_LIMIT = 10
+BACK_TIMEOUT = 1.0  # seconds within which repeated 'back' calls move deeper
 
 
 def log(msg):
+    # Prepend timestamp for better debugging
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a") as f:
-        f.write(f"{msg}\n")
+        f.write(f"[{ts}] {msg}\n")
 
 
 def load_state():
@@ -35,11 +42,11 @@ def save_state(state):
         print(f"Failed to save state: {e}", file=sys.stderr)
 
 
-# Parse workspace number (handles "3:web" → 3)
+# Parse workspace number (handles "3:web" -> 3)
 def parse_name(name: str) -> int:
     try:
         return int(name.split(":", 1)[0])
-    except ValueError:
+    except (ValueError, IndexError):
         return 9999  # fallback for non-numeric names
 
 
@@ -48,7 +55,11 @@ def get_current_workspace(i3):
     workspaces = i3.get_workspaces()
     current = next((ws for ws in workspaces if ws.focused), None)
     if current is None:
-        print("No focused workspace found", file=sys.stderr)
+        # If no focused workspace, maybe i3 is in a weird state.
+        # Try to find any workspace.
+        if workspaces:
+            return workspaces[0], workspaces
+        print("No workspaces found", file=sys.stderr)
         sys.exit(1)
     return current, workspaces
 
@@ -107,43 +118,44 @@ def back_on_output(i3):
     current, _ = get_current_workspace(i3)
     output = current.output
 
-    history = state.get(output, [])
+    data = state.get(output, {})
+    # Handle both old list format and new dict format
+    if isinstance(data, list):
+        history = data
+    else:
+        history = data.get("history", [])
+
     log(f"Back requested for output {output}. Current: {current.name}, History: {history}")
 
-    if len(history) >= 2:
-        # history[-1] should be the current workspace
-        # history[-2] is the last one
-        prev_ws = history[-2]
-        
-        # If history[-1] is NOT the current workspace, it might be out of sync
-        if history[-1] != current.name:
-            log(f"History out of sync! history[-1]({history[-1]}) != current({current.name})")
-            # We still try to switch to history[-1] as it's likely the "actual" previous one 
-            # if we just arrived at 'current' but the daemon hasn't updated yet.
-            prev_ws = history[-1]
-
-        log(f"Switching to workspace: '{prev_ws}'")
-        responses = i3.command(f"workspace {prev_ws}")
-        for r in responses:
-            if not r.success:
-                log(f"Command failed: {r.error}")
-            else:
-                log("Command sent successfully")
+    if len(history) < 2:
+        # If we only have one workspace in history, we can't toggle.
+        # However, if the one we have isn't the current one, it's effectively the 'last'.
+        if len(history) == 1 and history[0] != current.name:
+            target_ws = history[0]
+        else:
+            log("Not enough history to toggle.")
+            return
     else:
-        log("History length < 2, not enough data to switch")
+        # History is [last, current]
+        # If history[-1] is current, we go to history[-2]
+        if history[-1] == current.name:
+            target_ws = history[-2]
+        else:
+            # Out of sync, history[-1] is likely the last one
+            target_ws = history[-1]
+
+    log(f"Toggling to workspace: '{target_ws}'")
+    i3.command(f"workspace {target_ws}")
 
 
-def listen(i3):
+def listen():
     def update_state(i3, e):
-        # We listen to all workspace events and check if the change is 'focus'
         if e.change != "focus":
             return
 
         if not e.current:
             return
 
-        # e.current is a Con object which doesn't have .output directly.
-        # We find the corresponding WorkspaceReply to get the output name.
         workspaces = i3.get_workspaces()
         current_ws = next((ws for ws in workspaces if ws.name == e.current.name), None)
         
@@ -154,24 +166,57 @@ def listen(i3):
         output = current_ws.output
         name = current_ws.name
 
-        history = state.get(output, [])
-        # Only add if it's different from the last tracked workspace on this output
-        if not history or history[-1] != name:
-            history.append(name)
-            # Keep only the last 2 workspaces to allow simple back-and-forth
-            state[output] = history[-2:]
-            log(f"Updated {output}: {state[output]}")
+        data = state.get(output, {})
+        if isinstance(data, list):
+            history = data
+        else:
+            history = data.get("history", [])
+
+        # Strict toggle logic:
+        # We only care about the last workspace and the current one.
+        if not history:
+            history = [name]
+        elif history[-1] != name:
+            # New workspace focused. 
+            # The old history[-1] becomes the 'last' (history[0])
+            # The new 'name' becomes the 'current' (history[1])
+            history = [history[-1], name]
+            
+            state[output] = {"history": history}
+            log(f"Updated {output} pair: {history}")
             save_state(state)
 
-    # Initialize state with the currently focused workspace on its output
-    current, _ = get_current_workspace(i3)
-    state = load_state()
-    state[current.output] = [current.name]
-    save_state(state)
-    log(f"Daemon started. Current output {current.output} at {current.name}")
+    while True:
+        try:
+            log("Connecting to i3...")
+            i3 = i3ipc.Connection()
+            
+            current, _ = get_current_workspace(i3)
+            state = load_state()
+            output = current.output
+            
+            # Initialize or update the current workspace in state
+            data = state.get(output, {})
+            if isinstance(data, list):
+                history = data
+            else:
+                history = data.get("history", [])
 
-    i3.on("workspace::focus", update_state)
-    i3.main()
+            if not history:
+                history = [current.name]
+            elif history[-1] != current.name:
+                history = [history[-1], current.name]
+            
+            state[output] = {"history": history}
+            save_state(state)
+            
+            log(f"Daemon listening. Current output {current.output} at {current.name}")
+            i3.on("workspace::focus", update_state)
+            i3.main()
+        except Exception as e:
+            log(f"Daemon error: {e}")
+            time.sleep(2)
+
 
 
 def status():
@@ -179,8 +224,15 @@ def status():
     print(f"State file: {STATE_FILE}")
     print(f"Log file: {LOG_FILE}")
     print("History per output:")
-    for output, history in state.items():
-        print(f"  {output}: {history}")
+    for output, data in state.items():
+        if isinstance(data, list):
+            history = data
+            extra = ""
+        else:
+            history = data.get("history", [])
+            back_idx = data.get("back_index", 0)
+            extra = f" (back_index: {back_idx})"
+        print(f"  {output}: {history}{extra}")
 
 
 def main():
@@ -188,17 +240,19 @@ def main():
         print("Usage: i3-wscycle.py [toggle|next|prev|listen|back|status]")
         sys.exit(1)
 
-    i3 = i3ipc.Connection()
     cmd = sys.argv[1]
 
+    if cmd == "listen":
+        listen()
+        return
+
+    i3 = i3ipc.Connection()
     if cmd == "toggle":
         toggle_output(i3)
     elif cmd == "next":
         cycle_workspace(i3, +1)
     elif cmd == "prev":
         cycle_workspace(i3, -1)
-    elif cmd == "listen":
-        listen(i3)
     elif cmd == "back":
         back_on_output(i3)
     elif cmd == "status":
@@ -206,6 +260,7 @@ def main():
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
+
 
 
 if __name__ == "__main__":
